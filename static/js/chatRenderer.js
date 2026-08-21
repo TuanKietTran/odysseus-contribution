@@ -2783,6 +2783,37 @@ export function addMessage(role, content, modelName, metadata) {
       return null;
     }
 
+    // --- Research spin-off primer (system message) ---
+    // A Deep Research "Discuss" spin-off seeds the new session with a
+    // system message carrying the report as context, tagged with
+    // metadata.research_spinoff_from (see routes/research/research_routes.py).
+    // It is priming context the user never wrote and the model never said,
+    // so it does not belong in a msg-user/msg-ai bubble. Reuse the existing
+    // .msg-system chip (already used for slash-command responses and the
+    // stream-done toast) with the body collapsed behind a <details>, since
+    // the primer embeds a full research report and can be long.
+    if (role === 'system' && metadata?.research_spinoff_from) {
+      const sysWrap = document.createElement('div');
+      sysWrap.className = 'msg msg-system';
+      const sysBody = document.createElement('div');
+      sysBody.className = 'body';
+      const raw = String(textRaw || '');
+      const titleMatch = raw.match(/^\[([^\]]*)\]/);
+      const title = titleMatch ? titleMatch[1] : 'Research context';
+      const rest = titleMatch ? raw.slice(titleMatch[0].length).replace(/^\n+/, '') : raw;
+      const summary = document.createElement('summary');
+      summary.textContent = title;
+      const detailsBody = document.createElement('div');
+      detailsBody.innerHTML = markdownModule.processWithThinking(rest);
+      const details = document.createElement('details');
+      details.appendChild(summary);
+      details.appendChild(detailsBody);
+      sysBody.appendChild(details);
+      sysWrap.appendChild(sysBody);
+      box.appendChild(sysWrap);
+      return sysWrap;
+    }
+
     // --- Standard single-bubble message ---
     const wrap = document.createElement('div');
     wrap.className = 'msg ' + (role === 'user' ? 'msg-user' : 'msg-ai');
