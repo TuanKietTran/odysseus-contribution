@@ -37,6 +37,52 @@ import {
 import { createTerminalStreamError, isRecoverableStreamError } from './chatStreamErrors.js';
 import { loadPanel } from './panels.js';
 
+/**
+ * Minimal event accepted by {@link handleChatSubmit}. This also covers the
+ * synthetic event used when queued messages are submitted programmatically.
+ * @typedef {{ preventDefault: () => void }} ChatSubmitEvent
+ */
+
+/** @typedef {{ replaceFromHere?: boolean }} ResendOptions */
+
+/**
+ * State retained while a session continues streaming in the background.
+ * @typedef {Object} BackgroundStreamState
+ * @property {'running'|'completed'|'error'} status
+ * @property {string} accumulated
+ * @property {string} sourcesHtml
+ * @property {unknown} [findingsData]
+ * @property {AbortController} abortCtrl
+ * @property {string} query
+ * @property {Record<string, unknown> | null} metrics
+ */
+
+/**
+ * State owned by the foreground reader for a session.
+ * @typedef {Object} ActiveStreamState
+ * @property {AbortController} abortCtrl
+ * @property {HTMLElement | null} holder
+ * @property {string} query
+ * @property {number} startedAt
+ * @property {number} [lastActivity]
+ * @property {(() => void) | null} [cancelViewWork]
+ * @property {(() => void) | null} [finalizeView]
+ */
+
+/**
+ * A committed send generation and its controller. The controller is null while
+ * preflight work is still running and no request exists to abort.
+ * @typedef {{ generation: number, abortCtrl: AbortController | null }} ChatSendState
+ */
+
+/**
+ * Attachment metadata used by {@link openAttachment}.
+ * @typedef {Object} ChatAttachment
+ * @property {string} id Upload identifier.
+ * @property {string} [name] Original file name.
+ * @property {string} [mime] MIME type.
+ */
+
   const RESEARCH_TIMEOUT_MS = 360000;
   const DEFAULT_TIMEOUT_MS = 120000;
   const RUN_ID_ABORT_GRACE_MS = 2000; // timeout waits this long for a run-id header before hard-aborting
@@ -260,6 +306,10 @@ import { loadPanel } from './panels.js';
     });
   }
 
+  /**
+   * Compact the active chat's context window.
+   * @returns {Promise<boolean>} Whether compaction succeeded.
+   */
   export async function compactCurrentChatContext() {
     const sm = _liveSessionModule();
     const sid = sm && sm.getCurrentSessionId && sm.getCurrentSessionId();
@@ -282,6 +332,11 @@ import { loadPanel } from './panels.js';
   }
   try { window.compactCurrentChatContext = compactCurrentChatContext; } catch (_) {}
 
+  /**
+   * Refresh the context-usage indicator for the active chat.
+   * @param {string} [reason=''] Diagnostic reason used when logging failures.
+   * @returns {Promise<void>}
+   */
   export async function refreshChatContextHeader(reason = '') {
     _bindContextHeaderPill();
     const pill = document.getElementById('chat-context-pill');
@@ -619,21 +674,42 @@ import { loadPanel } from './panels.js';
   let currentSpinner = null; // Track current spinner for stop cleanup
 
   // Background streaming support
-  const _backgroundStreams = new Map(); // sessionId -> { status, accumulated, sourcesHtml, abortCtrl, query, metrics }
-  const _activeStreams = new Map();     // sessionId -> { abortCtrl, holder, query, startedAt, cancelViewWork, finalizeView }
-  const _resumingStreams = new Set();   // sessionId -> a resumeStream() reader is live (re-attach lock)
-  const _terminalSavedStreams = new Set(); // sessionId -> canonical terminal event seen by active reader
-  const _streamRunIds = new Map();      // sessionId -> opaque identity of the current send's detached run
-  const _streamGenerations = new Map(); // sessionId -> generation of the current (latest) send
-  const _sendStates = new Map();        // sessionId -> { generation, abortCtrl } of the current send, installed synchronously at send commit so Stop never has to borrow an older send's controller
-  const _pendingRunStops = new Map();   // 'sessionId:generation' -> abortCtrl|null; Stop queued for that send while it awaits headers. Keyed per send so concurrent sends' cancellation intents never displace each other.
-  let _streamSessionId = null; // Session ID for the currently active reader loop
-  let _lastReaderActivity = 0; // Timestamp of last reader.read() success — used to detect frozen streams
-  let _webLockRelease = null;  // Function to release the Web Lock held during streaming
+  /** @type {Map<string, BackgroundStreamState>} Session ID to detached stream state. */
+  const _backgroundStreams = new Map();
+  /** @type {Map<string, ActiveStreamState>} Session ID to foreground reader state. */
+  const _activeStreams = new Map();
+  /** @type {Set<string>} Session IDs with a live resumeStream reader (re-attach lock). */
+  const _resumingStreams = new Set();
+  /** @type {Set<string>} Session IDs whose active reader observed a canonical terminal event. */
+  const _terminalSavedStreams = new Set();
+  /** @type {Map<string, string>} Session ID to opaque detached-run identity. */
+  const _streamRunIds = new Map();
+  /** @type {Map<string, number>} Session ID to latest send generation. */
+  const _streamGenerations = new Map();
+  /** @type {Map<string, ChatSendState>} State installed synchronously when a send commits. */
+  const _sendStates = new Map();
+  /**
+   * Stop requests queued before response headers reveal a run ID. Keys are
+   * `sessionId:generation`, preventing concurrent sends from displacing one another.
+   * @type {Map<string, AbortController | null>}
+   */
+  const _pendingRunStops = new Map();
+  /** @type {string | null} Session ID for the currently active reader loop. */
+  let _streamSessionId = null;
+  /** @type {number} Timestamp of the latest successful reader.read(). */
+  let _lastReaderActivity = 0;
+  /** @type {(() => void) | null} Releases the Web Lock held during streaming. */
+  let _webLockRelease = null;
+  /** @type {boolean} Prevents overlapping stale-stream status probes. */
   let _staleStreamProbeInFlight = false;
+  /** @type {number} Maximum reader inactivity before checking server state. */
   const STALE_LOCAL_STREAM_MS = 15000;
 
-  /** Check if an SSE reader is still actively connected for a session. */
+  /**
+   * Check if an SSE reader is still actively connected for a session.
+   * @param {string} sessionId
+   * @returns {boolean}
+   */
   function hasActiveStream(sessionId) {
     return _activeStreams.has(sessionId) || _streamSessionId === sessionId || _backgroundStreams.has(sessionId) ||
            _resumingStreams.has(sessionId);
@@ -805,7 +881,9 @@ import { loadPanel } from './panels.js';
   }
 
   /**
-   * Initialize with dependencies
+   * Initialize chat services with the application's API base URL.
+   * @param {string} apiBase
+   * @returns {void}
    */
   export function init(apiBase) {
     API_BASE = apiBase;
@@ -1068,6 +1146,10 @@ import { loadPanel } from './panels.js';
     return true;
   }
 
+  /**
+   * Queue the current composer text while a response is streaming.
+   * @returns {boolean} Whether the submission was handled as a queue request.
+   */
   export function queueStreamingComposerRequest() {
     if (!isStreaming) return false;
     const queuedInput = uiModule.el('message');
@@ -1101,7 +1183,9 @@ import { loadPanel } from './panels.js';
 
 
   /**
-   * Handle chat form submission
+   * Handle a chat form submission or a programmatic queued submission.
+   * @param {ChatSubmitEvent} e
+   * @returns {Promise<void>}
    */
   export async function handleChatSubmit(e) {
     e.preventDefault();
@@ -4674,7 +4758,9 @@ import { loadPanel } from './panels.js';
   }
 
   /**
-   * Abort current chat request
+   * Abort the current chat request.
+   * @param {boolean} [stopServer=false] Also stop the exact detached server run.
+   * @returns {void}
    */
   // stopServer=true ONLY for an explicit user Stop. The run is now DETACHED
   // (survives tab close / navigation), so the generic abort used by cleanup
@@ -4888,8 +4974,10 @@ import { loadPanel } from './panels.js';
   }
 
   /**
-   * Detach current stream to run in background instead of aborting.
-   * Called when user switches sessions mid-stream.
+   * Detach the current stream to run in the background instead of aborting.
+   * Called when the user switches sessions mid-stream.
+   * @param {string} sessionId
+   * @returns {void}
    */
   export function detachCurrentStream(sessionId) {
     const active = sessionId ? _activeStreams.get(sessionId) : _getForegroundStreamState();
@@ -4944,8 +5032,10 @@ import { loadPanel } from './panels.js';
    * streams live; reply tokens render as they arrive. On completion a plain text
    * reply is finalized in place (canonical bubble via chatRenderer.addMessage, no
    * reload); a "rich" reply (tool calls, sources, doc streaming, multi-round) is
-   * reloaded from the DB so its full render stays faithful. Returns true if it
-   * attached, false to let the caller fall back to spinner+poll.
+   * reloaded from the DB so its full render stays faithful.
+   * @param {string} sessionId
+   * @param {HTMLElement | null} [replaceHolder=null] Placeholder to replace.
+   * @returns {Promise<boolean>} Whether a live server stream was attached.
    */
   export async function resumeStream(sessionId, replaceHolder = null) {
     if (!sessionId) return false;
@@ -5182,6 +5272,8 @@ import { loadPanel } from './panels.js';
   /**
    * Check for background streams when switching to a session.
    * Called after history loads on session switch.
+   * @param {string} sessionId
+   * @returns {void}
    */
   export function checkBackgroundStream(sessionId) {
     if (!sessionId || !_backgroundStreams.has(sessionId)) return;
@@ -5303,7 +5395,8 @@ import { loadPanel } from './panels.js';
   })();
 
   /**
-   * Initialize event listeners
+   * Initialize chat DOM event listeners.
+   * @returns {void}
    */
   export function initListeners() {
     // Global event delegation for copy-code buttons
@@ -5510,11 +5603,9 @@ import { loadPanel } from './panels.js';
   }
 
   /**
-   * Regenerate response: truncate history to the user message before this AI message,
-   * then re-submit that user message.
-   */
-  /**
-   * Edit a user message: show an input, truncate to before it, resubmit the edited text.
+   * Edit a user message, truncate the conversation before it, and resubmit it.
+   * @param {HTMLElement} userMsgElement User message bubble to edit.
+   * @returns {Promise<void>}
    */
   export async function editUserMessage(userMsgElement) {
     const box = document.getElementById('chat-history');
@@ -5602,6 +5693,9 @@ import { loadPanel } from './panels.js';
   /**
    * Resend a user message. Normal resend appends a fresh copy at the end of
    * the current thread; regenerate flows can opt into replacing from here.
+   * @param {HTMLElement} userMsgElement User message bubble to resend.
+   * @param {ResendOptions} [opts={}]
+   * @returns {Promise<void>}
    */
   export async function resendUserMessage(userMsgElement, opts = {}) {
     const replaceFromHere = Boolean(opts && opts.replaceFromHere);
@@ -5685,6 +5779,11 @@ import { loadPanel } from './panels.js';
     }
   }
 
+  /**
+   * Regenerate from the user turn preceding an AI message.
+   * @param {HTMLElement} aiMsgElement
+   * @returns {Promise<void>}
+   */
   export async function regenerateFrom(aiMsgElement) {
     const box = document.getElementById('chat-history');
     const allMsgs = Array.from(box.querySelectorAll('.msg'));
@@ -5935,6 +6034,11 @@ import { loadPanel } from './panels.js';
     }
   }
 
+  /**
+   * Fork the current session through the selected AI message.
+   * @param {HTMLElement} aiMsgElement
+   * @returns {Promise<void>}
+   */
   export async function forkFrom(aiMsgElement) {
     const box = document.getElementById('chat-history');
     const allMsgs = Array.from(box.querySelectorAll('.msg'));
@@ -5968,6 +6072,8 @@ import { loadPanel } from './panels.js';
    * Check for pending/completed research after page refresh or session switch.
    * If research is still running, show a spinner and poll until done.
    * If research is done, fetch result and render it.
+   * @param {string} sessionId
+   * @returns {Promise<void>}
    */
   export async function checkPendingResearch(sessionId) {
     if (!sessionId) return;
@@ -6189,23 +6295,36 @@ import { loadPanel } from './panels.js';
     }
   }
 
-  /** Set a display override for the next user message bubble */
+  /**
+   * Set a display override for the next user message bubble.
+   * @param {string | null} text
+   * @returns {void}
+   */
   export function setDisplayOverride(text) {
     _displayOverride = text;
   }
 
-  /** Hide the user bubble for the next submit (e.g. continue after stop) */
+  /**
+   * Hide the user bubble for the next submit (for example, continue after stop).
+   * @returns {void}
+   */
   export function setHideUserBubble() {
     _hideUserBubble = true;
   }
 
-  /** Set the AI element to merge with the next streamed response (continue after stop) */
+  /**
+   * Set the AI element to merge with the next streamed response.
+   * @param {HTMLElement | null} el
+   * @returns {void}
+   */
   export function setPendingContinue(el) {
     _pendingContinue = el;
   }
 
   /**
    * Delete an AI message and its preceding user message from the conversation.
+   * @param {HTMLElement} msgElement
+   * @returns {Promise<void>}
    */
   export async function deleteMessage(msgElement) {
     if (uiModule && uiModule.styledConfirm) {
@@ -6327,7 +6446,9 @@ import { loadPanel } from './panels.js';
   }
 
   /**
-   * Edit an AI message inline. Makes the body contentEditable, saves to DB on confirm.
+   * Edit an AI message inline and save it to the database on confirmation.
+   * @param {HTMLElement} msgElement
+   * @returns {Promise<void>}
    */
   export async function editAIMessage(msgElement) {
     const body = msgElement.querySelector('.body');
@@ -6415,7 +6536,9 @@ import { loadPanel } from './panels.js';
   /**
    * Rewrite the AI's last response with a specific instruction.
    * Uses the lightweight /api/rewrite endpoint — no tools, no agent loop.
-   * Just rewrites the text of the last AI bubble.
+   * @param {HTMLElement} aiMsgElement
+   * @param {string} instruction
+   * @returns {Promise<void>}
    */
   export async function rewriteWith(aiMsgElement, instruction) {
     const sessionId = sessionModule.getCurrentSessionId();
@@ -6574,6 +6697,8 @@ import { loadPanel } from './panels.js';
 
   /**
    * Continue the AI's response from where it left off.
+   * @param {HTMLElement} aiMsgElement
+   * @returns {Promise<void>}
    */
   export async function continueFrom(aiMsgElement) {
     const sessionId = sessionModule.getCurrentSessionId();
@@ -6602,6 +6727,12 @@ import { loadPanel } from './panels.js';
       bash:'bash', sql:'sql', csv:'csv', xml:'xml' };
     return map[ext] || '';
   }
+  /**
+   * Open an uploaded attachment in the most appropriate viewer.
+   * @param {ChatAttachment} att
+   * @param {boolean} isImage
+   * @returns {Promise<void>}
+   */
   async function openAttachment(att, isImage) {
     if (!att || !att.id) return;
     const id = att.id, name = att.name || '', mime = att.mime || '';
