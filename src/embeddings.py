@@ -39,6 +39,52 @@ _DEFAULT_MODEL = "all-minilm:l6-v2"
 _DEFAULT_FASTEMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
+def _parse_embedding_response(data: object, expected_count: int) -> List[List[float]]:
+    """Validate and order an OpenAI-compatible embeddings response.
+
+    Providers occasionally return a successful HTTP response with missing,
+    duplicated, or malformed vectors. Failing at the boundary keeps bad data
+    out of Chroma and produces an actionable error instead of a later shape
+    mismatch during retrieval.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        raise ValueError("Embedding response must contain a data array")
+
+    items = data["data"]
+    if len(items) != expected_count:
+        raise ValueError(
+            f"Embedding response count mismatch: expected {expected_count}, got {len(items)}"
+        )
+
+    ordered = []
+    indexes = set()
+    dimension = None
+    for fallback_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError("Embedding response contains a non-object item")
+        index = item.get("index", fallback_index)
+        if isinstance(index, bool) or not isinstance(index, int) or index in indexes:
+            raise ValueError("Embedding response contains invalid or duplicate indexes")
+        if index < 0 or index >= expected_count:
+            raise ValueError(f"Embedding response index out of range: {index}")
+        vector = item.get("embedding")
+        if not isinstance(vector, list) or not vector:
+            raise ValueError(f"Embedding {index} is missing a non-empty vector")
+        if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value) for value in vector):
+            raise ValueError(f"Embedding {index} contains a non-finite or non-numeric value")
+        if dimension is None:
+            dimension = len(vector)
+        elif len(vector) != dimension:
+            raise ValueError("Embedding response contains inconsistent vector dimensions")
+        indexes.add(index)
+        ordered.append((index, vector))
+
+    if indexes != set(range(expected_count)):
+        raise ValueError("Embedding response indexes do not cover the request")
+    ordered.sort(key=lambda pair: pair[0])
+    return [vector for _, vector in ordered]
+
+
 class EmbeddingClient:
     """Drop-in replacement for SentenceTransformer.encode() using an HTTP API."""
 
@@ -121,12 +167,13 @@ class EmbeddingClient:
             json={"input": batch, "model": self.model},
         )
         resp.raise_for_status()
-        data = resp.json()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise ValueError("Embedding endpoint returned invalid JSON") from exc
 
         # OpenAI format: {"data": [{"embedding": [...], "index": 0}, ...]}
-        embeddings = data.get("data", [])
-        embeddings.sort(key=lambda e: e.get("index", 0))
-        return [emb["embedding"] for emb in embeddings]
+        return _parse_embedding_response(data, len(batch))
 
 
 class FastEmbedClient:

@@ -150,7 +150,7 @@ Some non-route tool/script paths can index ownerless or arbitrary directories an
 
 `routes/embedding_routes.py` owns admin-gated embedding model and custom endpoint management. It validates custom endpoints with outbound URL checks, can persist and process-expose `EMBEDDING_API_KEY`, resets embedding/RAG/tool-index/Chroma state, and does not own document extraction.
 
-`src.embeddings` owns HTTP embedding fallback to FastEmbed and process-level endpoint state. `src.embedding_lanes` keeps custom HTTP embedding vectors separate from FastEmbed fallback vectors with lane-specific Chroma collections, migrates legacy unsuffixed collections into empty lanes, and dedupes query results across lanes. `src.chroma_client` owns native Chroma defaults and fast reachability checks.
+`src.embeddings` owns HTTP embedding fallback to FastEmbed and process-level endpoint state. HTTP responses are validated at this boundary: the `data` array must match the requested batch size, indexes must cover the batch exactly once, vectors must be non-empty finite numeric arrays, and all vectors in a batch must share one dimension. This prevents malformed provider responses from entering Chroma and turns them into actionable errors. `src.embedding_lanes` keeps custom HTTP embedding vectors separate from FastEmbed fallback vectors with lane-specific Chroma collections, migrates legacy unsuffixed collections into empty lanes, and dedupes query results across lanes. `src.chroma_client` owns native Chroma defaults and fast reachability checks.
 
 ## Compatibility State
 
@@ -190,7 +190,7 @@ Bearer-token callers are not a scoped document/upload API surface today. Routes 
 
 ## Testing Coverage
 
-Existing useful coverage includes upload owner scope, upload IDs, upload atomicity, durable attachment reference normalization, message/document/note/calendar write reservations, fail-closed reference-aware cleanup, attachment budgets, `.nix` text upload handling, upload/PDF security regressions, Docker `libmagic`/`python-magic` upload detection, RAG owner fallback, Chroma fast-fail, MarkItDown runtime, PDF runtime, document-library counter updates, and selected document helper behavior.
+Existing useful coverage includes upload owner scope, upload IDs, upload atomicity, durable attachment reference normalization, message/document/note/calendar write reservations, fail-closed reference-aware cleanup, attachment budgets, `.nix` text upload handling, upload/PDF security regressions, Docker `libmagic`/`python-magic` upload detection, RAG owner fallback, Chroma fast-fail, MarkItDown runtime, PDF runtime, document-library counter updates, and selected document helper behavior. `tests/test_embedding_response_contract.py` covers ordering, cardinality, index integrity, numeric finiteness, and dimension consistency for provider responses.
 
 Route-level coverage is thinner for document CRUD, PDF import/render/export/fill, direct RAG upload, embedding admin/security behavior, and RAG unavailable states.
 
